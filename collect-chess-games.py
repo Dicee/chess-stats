@@ -290,15 +290,19 @@ def classify_time_control(time_control):
         return "N/A"
 
     if time_control.find('/') >= 0:
-        base_time = int(time_control.split('/')[1])
+        average_game_time = int(time_control.split('/')[1])
     else:
-        base_time = int(time_control.split('+')[0])
+        # Seems like an average amateur game lasts about 30 moves: https://chess-teacher.com/the-average-number-of-moves/.
+        # We will therefore take into account 30 increments (technically should 29 but ok, this is just an approximation).
+        parts = time_control.split('+')
+        increment = 0 if len(parts) == 1 else int(parts[1]) 
+        average_game_time = int(parts[0]) + 30 * increment
 
-    if base_time <= 120:
+    if average_game_time <= 120:
         return "Bullet"
-    elif base_time <= 300:
+    elif average_game_time <= 300:
         return "Blitz"
-    elif base_time <= 1800:
+    elif average_game_time <= 1800:
         return "Rapid"
     else:
         return "Daily"  

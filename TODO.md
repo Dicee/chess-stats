@@ -1,9 +1,5 @@
 # TODO
 
-## Game collection script
-
-- validate end date is less than current date
-
 ## Jupyter notebook
 
 - improve time control detection (average time rather than base time). Important when the increment is large (for example 2+15 is considered to be rapid by lichess.org because after 30 moves you have consumed up to 9m30s).
@@ -15,4 +11,9 @@
 
 - would be nice to have an HTML page, or maybe directly in the Jupyter notebook but seems less flexible, allowing to add filters (e.g. date, ELO, time control), view the top openings and top opening weaknesses in a table and then being able to drill down in each one, with a separate page showing detailed performance in the opening for each line
 
+# Done
+
+## Game collection script
+
+- validate end date is less than current date
 
