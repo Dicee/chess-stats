@@ -1,0 +1,535 @@
+import argparse
+import datetime
+import csv
+import re
+import sys
+import os
+import json
+from pathlib import Path
+import requests
+
+GAME_SYNTHESIS_HEADER = ["link", "date", "color", "elo", "time_control", "variant", "termination", "result", "opening_family", "eco", "moves"]
+EXCLUDED_VARIANTS = ["Atomic", "Horde", "Crazyhouse", "Chess960"]
+
+def get_month_range(start_date, end_date):
+    """
+    Generates a sequence of (year, month) tuples between two dates.
+    """
+    current_date = start_date
+    while current_date <= end_date:
+        yield (current_date.year, current_date.month)
+        # Move to the next month
+        if current_date.month == 12:
+            current_date = current_date.replace(year=current_date.year + 1, month=1)
+        else:
+            current_date = current_date.replace(month=current_date.month + 1)
+
+
+def fetch_chess_com_games(username, start_date, end_date, platform_base_dir):
+    """
+    Fetches games for a chess.com user and saves them to PGN files.
+    """
+    print(f"\nProcessing chess.com games for user: {username}")
+    
+    user_games_dir = platform_base_dir / username
+    user_games_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  - Created user directory: {user_games_dir}")
+
+    months = list(get_month_range(start_date, end_date))
+    
+    for year, month in tqdm.tqdm(months, desc="Downloading chess.com games"):
+        pgn_path = user_games_dir / f"{username}-{year}-{month:02d}.pgn"
+        
+        if pgn_path.exists():
+            continue
+
+        url = f"https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
+        try:
+            response = requests.get(url, headers={"User-Agent": "chess-stats-retriever/1.0"})
+            response.raise_for_status()  # Raise an exception for bad status codes
+
+            with open(pgn_path, "w") as f:
+                f.write(response.text)
+
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: Could not retrieve games for {year}-{month:02d}. Error: {e}", file=sys.stderr)
+
+
+def fetch_lichess_games(username, start_date, end_date, platform_base_dir):
+    """
+    Fetches games for a lichess.org user and saves them to a PGN file.
+    """
+    print(f"\nProcessing lichess.org games for user: {username}")
+
+    user_games_dir = platform_base_dir / username
+    user_games_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  - Created user directory: {user_games_dir}")
+
+    months = list(get_month_range(start_date.date(), end_date.date()))
+
+    for year, month in tqdm.tqdm(months, desc="Downloading lichess.org games"):
+        pgn_path = user_games_dir / f"{username}-{year}-{month:02d}.pgn"
+
+        if pgn_path.exists():
+            continue
+
+        # Lichess API uses timestamps in milliseconds
+        start_of_month = datetime.datetime(year, month, 1)
+        
+        if month == 12:
+            end_of_month = datetime.datetime(year + 1, 1, 1) - datetime.timedelta(milliseconds=1)
+        else:
+            end_of_month = datetime.datetime(year, month + 1, 1) - datetime.timedelta(milliseconds=1)
+
+        since = int(start_of_month.timestamp() * 1000)
+        until = int(end_of_month.timestamp() * 1000)
+
+        url = f"https://lichess.org/api/games/user/{username}"
+        params = {
+            "since": since,
+            "until": until,
+            "pgnInJson": "false",
+            "clocks": "true",
+            "evals": "true",
+        }
+
+        try:
+            with requests.get(url, params=params, stream=True, headers={"User-Agent": "chess-stats-retriever/1.0"}) as response:
+                response.raise_for_status()
+                
+                total_size = int(response.headers.get('content-length', 0))
+                
+                with open(pgn_path, "wb") as f, tqdm.tqdm(
+                    desc=f"Downloading {year}-{month:02d}",
+                    total=total_size,
+                    unit='iB',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    leave=False
+                ) as bar:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        bar.update(len(chunk))
+
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: Could not retrieve games for {year}-{month:02d}. Error: {e}", file=sys.stderr)
+
+
+def validate_date(date_string):
+    """
+    Validates and parses date strings in YYYY-MM format.
+    Returns a datetime.date object.
+    """
+    if not date_string:
+        return None
+
+    try:
+        return datetime.datetime.strptime(date_string, '%Y-%m').date()
+    except ValueError:
+        pass
+
+    raise argparse.ArgumentTypeError(
+        f"Invalid date format: {date_string}. Expected YYYY-MM format."
+    )
+
+def parse_chess_com_games(username, output_file):
+    """
+    Parses lichess games and appends them to a TSV file.
+    """
+    print(f"\nParsing chess.com games for user: {username}")
+
+    home_dir = Path.home()
+    chess_com_base_dir = home_dir / ".chess-stats" / "chess.com"
+    user_games_dir = chess_com_base_dir / username
+
+    pgn_files = os.listdir(user_games_dir)
+
+    file_exists = output_file.exists() and output_file.stat().st_size > 0
+    rows = 0
+
+    with open(output_file, "a", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        if not file_exists:
+            writer.writerow(GAME_SYNTHESIS_HEADER)
+
+        for pgn_file in pgn_files:
+            pgn_file = user_games_dir / pgn_file
+            
+            with open(pgn_file, "r") as pgn:
+                content = pgn.read()
+
+            games = json.loads(content)["games"]
+
+            for json_game in games:
+                url = json_game["url"]
+                file_name_parts = pgn_file.stem.split('-')
+                date = f"{file_name_parts[1]}-{file_name_parts[2]}"
+
+                if not "pgn" in json_game:
+                    continue # can happen for example for bughouse games
+
+                game = parse_pgn(username, json_game["pgn"])
+
+                if game is None or game["variant"] in EXCLUDED_VARIANTS:
+                    continue
+
+                rows += 1
+                writer.writerow([
+                    url,
+                    date,
+                    game["color"],
+                    game["elo"],
+                    game["time_control"],
+                    game["variant"],
+                    game["termination"],
+                    game["result"],
+                    game["opening_family"],
+                    game["eco"],
+                    game["moves"],
+                ])
+    print(f"  - Wrote {rows} rows for chess.com games to {output_file}")
+
+def parse_lichess_games(username, output_file):
+    """
+    Parses lichess games and appends them to a TSV file.
+    """
+    print(f"\nParsing lichess.org games for user: {username}")
+
+    home_dir = Path.home()
+    lichess_base_dir = home_dir / ".chess-stats" / "lichess.org"
+    user_games_dir = lichess_base_dir / username
+
+    pgn_files = os.listdir(user_games_dir)
+
+    file_exists = output_file.exists() and output_file.stat().st_size > 0
+    rows = 0
+
+    with open(output_file, "a", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        if not file_exists:
+            writer.writerow(GAME_SYNTHESIS_HEADER)
+
+        for pgn_file in pgn_files:
+            pgn_file = user_games_dir / pgn_file
+            with open(pgn_file, "r") as pgn:
+                content = pgn.read()
+
+            games = re.split(r'\n\n(?=\[Event)', content)
+
+            for game_raw in games:
+                if not game_raw:
+                    continue
+
+                file_name_parts = pgn_file.stem.split('-')
+                date = f"{file_name_parts[1]}-{file_name_parts[2]}"
+                game = parse_pgn(username, game_raw)
+
+                if game is None or game["variant"] in EXCLUDED_VARIANTS or game["opponent"] == "lichess AI":
+                    continue
+
+                rows += 1
+                writer.writerow([
+                    game["site"],
+                    date,
+                    game["color"],
+                    game["elo"],
+                    game["time_control"],
+                    game["variant"],
+                    game["termination"],
+                    game["result"],
+                    game["opening_family"],
+                    game["eco"],
+                    game["moves"],
+                ])
+    print(f"  - Wrote {rows} rows for lichess games to {output_file}")
+
+def parse_pgn(username, pgn_raw):
+    lines = pgn_raw.strip().split("\n")
+    metadata = {}
+    moves_line = ""
+
+    for line in lines:
+        if line.startswith("["):
+            match = re.match(r'\[(\w+)\s+"([^"]+)"\]', line)
+            if match:
+                key, value = match.groups()
+                metadata[key] = value
+        elif line.startswith("1."):
+            moves_line = line
+
+    white_player = metadata.get("White", "")
+    black_player = metadata.get("Black", "")
+
+    color = "White" if white_player.lower() == username.lower() else "Black"
+    opponent = metadata.get("Black") if color == "White" else  metadata.get("White")
+    elo = metadata.get(f"{color}Elo")
+    variant = metadata.get("Variant", "")
+    eco = metadata.get("ECO", "")
+
+    if len(moves_line) == 0:
+        return None # can happen if the game was immediately abandoned
+
+    return {
+        "site": metadata.get("Site", ""),
+        "color": color,
+        "elo": elo,
+        "opponent": opponent,
+        "time_control": classify_time_control(metadata.get("TimeControl", "")),
+        "variant": variant,
+        "termination": metadata.get("Termination", ""),
+        "result": metadata.get("Result", ""),
+        "variant": metadata.get("Variant", ""),
+        "opening_family": classify_opening_family(eco),
+        "eco": eco,
+        "moves": moves_line,
+    }        
+
+# reference: https://www.saremba.de/chessgml/standards/pgn/pgn-complete.htm#c9.6
+def classify_time_control(time_control):
+    if time_control == "-":
+        return "N/A"
+
+    if time_control.find('/') >= 0:
+        base_time = int(time_control.split('/')[1])
+    else:
+        base_time = int(time_control.split('+')[0])
+
+    if base_time <= 120:
+        return "Bullet"
+    elif base_time <= 300:
+        return "Blitz"
+    elif base_time <= 1800:
+        return "Rapid"
+    else:
+        return "Daily"  
+
+# reference: https://www.365chess.com/eco.php
+def classify_opening_family(eco): 
+    if eco == "?":
+        return None # can happen in variant games
+
+    volume = eco[0]
+    id = int(eco[1:])
+    if volume == 'A':
+        if id == 0:
+            return "Polish opening"
+        elif id == 1:
+            return "Nimzovich-Larsen attack"
+        elif id <= 3:
+            return "Bird's opening"
+        elif id <= 9:
+            return "Reti opening"
+        elif id <= 39:
+            return "English opening"
+        elif id <= 41:
+            return "Queen's pawn"
+        elif id == 42: 
+            return "Modern defence, Averbakh system"
+        elif id <= 44:
+            return "Old Benoni defence"
+        elif id <= 46:
+            return "Queen's pawn game"
+        elif id == 47:
+            return "Queen's Indian defence"
+        elif id <= 49:
+            return "King's Indian, East Indian defence"
+        elif id == 50:
+            return "Queen's pawn game"
+        elif id <= 52:
+            return "Budapest defence"
+        elif id <= 55:
+            return "Old Indian defence"
+        elif id == 56:
+            return "Benoni defence"    
+        elif id <= 59:
+            return "Benko gambit"
+        elif id <= 79:
+            return "Benoni defence" 
+        elif id <= 99:
+            return "Dutch"
+    elif volume == 'B':
+        if id == 0:
+            return "King's pawn opening"
+        elif id == 1:
+            return "Scandinavian (centre counter) defence"
+        elif id <= 5:
+            return "Alekhine's defence"
+        elif id == 6:
+            return "Robatsch (modern) defence"    
+        elif id <= 9:
+            return "Pirc defence"
+        elif id <= 19:
+            return "Caro-Kann defence"
+        elif id <= 99:
+            return "Sicilian defence"
+    elif volume == 'C':
+        if id <= 19:
+            return "French defence"
+        elif id == 20:
+            return "King's pawn game"
+        elif id <= 22:
+            return "Center game"
+        elif id <= 24:
+            return "Bishop's opening"
+        elif id <= 29:
+            return "Vienna game"
+        elif id <= 39:
+            return "King's gambit"
+        elif id == 40:
+            return "King's knight opening"
+        elif id == 41:
+            return "Philidor's defence"
+        elif id <= 43:
+            return "Petrov's defence"
+        elif id == 44:
+            return "King's pawn game"
+        elif id == 45:
+            return "Scotch game"
+        elif id <= 46:
+            return "Three knights game"
+        elif id <= 49:
+            return "Four knights game, Scotch variation"
+        elif id == 50:
+            return "Italian game"
+        elif id <= 52:
+            return "Evan's gambit"
+        elif id <= 54:
+            return "Giuoco piano"
+        elif id <= 59:
+            return "Two knights defence"
+        elif id <= 99:
+            return "Ruy Lopez (Spanish opening)"    
+    elif volume == 'D':
+        if id == 0:
+            return "Queen's pawn game"
+        elif id == 1:
+            return "Richter-Veresov attack"
+        elif id == 2:
+            return "Queen's pawn game"
+        elif id == 3:
+            return "Torre attack (Tartakower variation)"
+        elif id <= 5:
+            return "Queen's pawn game"
+        elif id == 6:
+            return "Queen's gambit"
+        elif id <= 9:
+            return "Queen's gambit declined, Chigorin defence"
+        elif id <= 15:
+            return "Queen's gambit declined, Slav defence"
+        elif id == 16:  
+            return "Queen's gambit declined Slav accepted, Alapin variation"
+        elif id <= 19:
+            return "Queen's gambit declined Slav, Czech defence"
+        elif id <= 29:
+            return "Queen's gambit accepted"
+        elif id <= 42:
+            return "Queen's gambit declined"
+        elif id <= 49:
+            return "Queen's gambit declined, semi-Slav"
+        elif id <= 69:
+            return "Queen's gambit declined, 4. Bg5"
+        elif id <= 79:
+            return "Neo-Gruenfeld defence"
+        elif id <= 99:
+            return "Gruenfeld defence"
+    elif volume == 'E':
+        if id == 0:
+            return "Queen's pawn game"
+        elif id <= 9:
+            return "Catalan, closed"
+        elif id == 10:
+            return "Queen's pawn game"
+        elif id == 11:
+            return "Bogo-Indian defence"
+        elif id <= 19:
+            return "Queen's indian defence"
+        elif id <= 59:
+            return "Nimzo-Indian defence"
+        elif id <= 99:
+            return "King's Indian defence"
+
+    raise Error(f"Unrecognized ECO code: {eco}")                        
+
+def cli():
+    parser = argparse.ArgumentParser(
+        description="Collects and parses chess games from Lichess and Chess.com"
+    )
+
+    parser.add_argument(
+        "--chess-com-username",
+        type=str,
+        help="Chess.com username to collect games from.",
+    )
+    parser.add_argument(
+        "--lichess-username",
+        type=str,
+        help="Lichess username to collect games from.",
+    )
+    parser.add_argument(
+        "--start-date",
+        "-s",
+        type=validate_date,
+        help="Start date for game collection (YYYY-MM).",
+        required=True,
+    )
+    parser.add_argument(
+        "--end-date",
+        "-e",
+        type=validate_date,
+        help="End date for game collection (YYYY-MM). Defaults to current day if not specified.",
+    )
+
+    args = parser.parse_args()
+
+    if not args.chess_com_username and not args.lichess_username:
+        parser.error("At least one of --chess-com-username or --lichess-username must be provided.")
+
+    end_date = args.end_date if args.end_date else datetime.date.today()
+
+    if args.start_date and args.start_date > end_date:
+        parser.error(f"Start date ({args.start_date}) cannot be after end date ({end_date}).")
+
+    # Create base directories
+    home_dir = Path.home()
+    chess_com_base_dir = home_dir / ".chess-stats" / "chess.com"
+    lichess_base_dir = home_dir / ".chess-stats" / "lichess.org"
+    
+    print("Creating base directories...")
+    chess_com_base_dir.mkdir(parents=True, exist_ok=True)
+    lichess_base_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  - Created: {chess_com_base_dir}")
+    print(f"  - Created: {lichess_base_dir}")
+
+    output_dir = home_dir / ".chess-stats" / "game-synthesis" / normalized_username(args.chess_com_username, args.lichess_username)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / "games.tsv"
+
+    if output_file.exists():
+        os.remove(output_file)
+
+    if args.chess_com_username:
+        fetch_chess_com_games(args.chess_com_username, args.start_date, end_date, chess_com_base_dir)
+        parse_chess_com_games(args.chess_com_username, output_file)
+
+    if args.lichess_username:
+        start_datetime = datetime.datetime.combine(args.start_date, datetime.time.min)
+        end_datetime = datetime.datetime.combine(end_date, datetime.time.max)
+        fetch_lichess_games(args.lichess_username, start_datetime, end_datetime, lichess_base_dir)
+        parse_lichess_games(args.lichess_username, output_file)
+
+# if both usernames are provided, we return the chess.com one even if the Lichess username might be different
+def normalized_username(chess_com_username, lichess_username):
+    if chess_com_username is None:
+        return lichess_username
+    return chess_com_username
+
+if __name__ == "__main__":
+    # Check for required packages
+    try:
+        import requests
+        import tqdm
+    except ImportError:
+        print("Error: Missing required packages. Please install them using:", file=sys.stderr)
+        print("pip install requests tqdm", file=sys.stderr)
+        sys.exit(1)
+    cli()
