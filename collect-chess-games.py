@@ -7,6 +7,8 @@ import os
 import json
 from pathlib import Path
 import requests
+import time
+import tqdm
 
 GAME_SYNTHESIS_HEADER = ["link", "date", "color", "elo", "time_control", "variant", "termination", "result", "opening_family", "eco", "moves"]
 EXCLUDED_VARIANTS = ["Atomic", "Horde", "Crazyhouse", "Chess960"]
@@ -98,6 +100,10 @@ def fetch_lichess_games(username, start_date, end_date, platform_base_dir):
                 response.raise_for_status()
                 
                 total_size = int(response.headers.get('content-length', 0))
+
+                # avoid throttling when we get to a time period without games (causes several requests in quick succession)
+                if total_size == 0:
+                    time.sleep(0.5)
                 
                 with open(pgn_path, "wb") as f, tqdm.tqdm(
                     desc=f"Downloading {year}-{month:02d}",
@@ -264,7 +270,7 @@ def parse_pgn(username, pgn_raw):
     opponent = metadata.get("Black") if color == "White" else  metadata.get("White")
     elo = metadata.get(f"{color}Elo")
     variant = metadata.get("Variant", "")
-    eco = metadata.get("ECO", "")
+    eco = metadata.get("ECO", "?")
 
     if len(moves_line) == 0:
         return None # can happen if the game was immediately abandoned
