@@ -1,0 +1,12 @@
+[project]
+name = "chess-stats"
+version = "0.1.0"
+description = "A simple set of scripts to collect chess games from lichess.org and chess.com and make some analysis on opening performance."
+readme = "README.md"
+requires-python = ">=3.14.0"
+dependencies = [
+    "jupyterlab>=4.5.3",
+    "pandas>=3.0.0",
+    "requests>=2.32.5",
+    "tqdm>=4.67.1",
+]
