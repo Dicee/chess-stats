@@ -35,7 +35,7 @@ app = Dash(__name__)
 
 def _load_base_df(file_path=None):
     """Load required columns from a CSV/TSV file path."""
-    columns = ["game_moves", "result", "opening_family", "opening_name"]
+    columns = ["game_moves", "result", "opening_family", "opening_name", "color"]
     if not file_path:
         raise ValueError("Missing games file path. Pass --games /path/to/file.tsv")
 
@@ -131,11 +131,17 @@ def compute_position_stats(records, path_moves, top_n: int = 30):
 
     top_family = None
     top_opening_name = None
+
+    all_names = {n for ns in names_by_family.values() for n in ns if n}
+    if len(all_names) == 1:
+        top_opening_name = list(all_names)[0]
+
     if family_counts:
-        top_family = family_counts.most_common(1)[0][0]
-        names = {n for n in names_by_family.get(top_family, set()) if n}
-        if len(names) == 1:
-            top_opening_name = list(names)[0]
+        best_family, best_count = family_counts.most_common(1)[0]
+        only_one_family = len(family_counts) == 1
+        majority_and_deep = path_len >= 4 and best_count > matched / 2
+        if only_one_family or majority_and_deep:
+            top_family = best_family
 
     rows = []
     for mv, n in move_counts.most_common(top_n):
@@ -354,6 +360,15 @@ app.layout = html.Div(
             ],
         ),
         html.Hr(),
+        dcc.Tabs(
+            id="color-tabs",
+            value="White",
+            children=[
+                dcc.Tab(label="As White", value="White"),
+                dcc.Tab(label="As Black", value="Black"),
+            ],
+            style={"marginBottom": "12px"},
+        ),
         dcc.Store(id="path-store", data=[]),
         dcc.Store(id="base-data-store"),
         dcc.Interval(id="init", interval=200, n_intervals=0, max_intervals=1),
@@ -410,10 +425,19 @@ def load_data(_):
     df = _load_base_df(DEFAULT_DATA_PATH)
     df["_tokens"] = df["game_moves"].apply(_tokenize_moves)
     # Keep only useful columns for serialization
-    slim = df[["result", "_tokens", "opening_family", "opening_name"]].to_dict(orient="records")
+    slim = df[["result", "_tokens", "opening_family", "opening_name", "color"]].to_dict(orient="records")
     return slim, f"Loaded {len(df):,} game" + ("s" if len(df) > 1 else "")    
 
 
+
+
+@app.callback(
+    Output("path-store", "data", allow_duplicate=True),
+    Input("color-tabs", "value"),
+    prevent_initial_call=True,
+)
+def reset_on_tab_change(_):
+    return []
 
 
 @app.callback(
@@ -443,15 +467,14 @@ def reset_or_back(_, __, path):
     Output("moves-list", "children"),
     Input("path-store", "data"),
     Input("base-data-store", "data"),
+    Input("color-tabs", "value"),
 )
-def render(path, base_data):
-
-
+def render(path, base_data, player_color):
     path = path or []
     if not base_data:
         return "", "", "", html.Div("Loading data…")
 
-    records = base_data
+    records = [r for r in base_data if r.get("color") == player_color]
 
     # Next player is determined by ply parity
     next_player = "White" if (len(path) % 2 == 0) else "Black"
@@ -463,10 +486,12 @@ def render(path, base_data):
     current_line = "Start position" if len(path) == 0 else moves_so_far
     side_to_play = f"Next to play: {next_player}"
 
-    if top_family:
-        opening_info = f"Opening: {top_family}" + (f" — {top_opening_name}" if top_opening_name else "")
+    if top_opening_name:
+        opening_info = f"Opening: {top_family} — {top_opening_name}" if top_family else f"Opening: {top_opening_name}"
+    elif top_family:
+        opening_info = f"Opening: {top_family}"
     else:
-        opening_info = "Opening: (unknown)"
+        opening_info = ""
 
     if stats.empty:
         return current_line, side_to_play, opening_info, html.Div("No game match this line.")
